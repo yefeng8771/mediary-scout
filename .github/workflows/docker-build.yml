@@ -3,9 +3,9 @@
 # 没有发布任何预构建镜像。本 workflow 只新增、不改上游任何文件，
 # 上游同步时零冲突。
 #
-# 产出两个镜像（compose 里仅有的两个自建服务）：
-#   web     → ghcr.io/yefeng8771/mediary-scout
-#   updater → ghcr.io/yefeng8771/mediary-scout-updater
+# 只构建应用本体 web 一个镜像（2026-11-10 用户拍板）：
+#   ghcr.io/yefeng8771/mediary-scout
+# updater 不打镜像：它的一键更新走本地 compose build，与拉镜像部署是两条路；
 # 其余服务（postgres / pansou / cloudflared）上游 compose 已用公开镜像，不处理。
 name: docker-build
 
@@ -15,7 +15,7 @@ on:
     tags: ['v*']
   schedule:
     # 每天 11:37 CST 兜底：若 main 已有新提交但 push 未触发构建
-    # （如日后用 GITHUB_TOKEN 同步上游），当天也会打出新镜像；
+    # （如 GITHUB_TOKEN 的同步推送），当天也会打出新镜像；
     # 当前提交已打过则由下面的 skip 检查直接跳过，不重复构建。
     - cron: '37 3 * * *'
   workflow_dispatch:
@@ -30,24 +30,8 @@ concurrency:
 
 jobs:
   build:
-    name: build (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: web
-            context: .
-            file: ./Dockerfile
-            image: ghcr.io/yefeng8771/mediary-scout
-            build_args: |
-              GIT_SHA=${{ github.sha }}
-          - name: updater
-            context: ./updater
-            file: ./updater/Dockerfile
-            image: ghcr.io/yefeng8771/mediary-scout-updater
-            build_args: ''
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -69,7 +53,7 @@ jobs:
       - name: 当前提交已打过镜像则跳过（定时触发去重）
         id: skip
         run: |
-          TAG="${{ matrix.image }}:sha-$(git rev-parse --short HEAD)"
+          TAG="ghcr.io/yefeng8771/mediary-scout:sha-$(git rev-parse --short HEAD)"
           if docker manifest inspect "$TAG" >/dev/null 2>&1; then
             echo "镜像 $TAG 已存在，跳过构建"
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -82,7 +66,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ matrix.image }}
+          images: ghcr.io/yefeng8771/mediary-scout
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short,prefix=sha-
@@ -92,12 +76,13 @@ jobs:
         if: steps.skip.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.file }}
+          context: .
+          file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: ${{ matrix.build_args }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

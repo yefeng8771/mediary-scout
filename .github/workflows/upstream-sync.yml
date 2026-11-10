@@ -1,0 +1,90 @@
+# yefeng8771 fork 新增：每日自动同步上游 fancydirty/mediary-scout
+# 模板沿用 yefeng8771/stundeck 已验证的强制合并方案（冲突一律按上游为准）。
+# 一个适配：同步推送走 GITHUB_TOKEN，它推不了 .github/workflows 的变更
+# （会 422，ticket-monitoring 踩过），所以合并后把 .github/workflows
+# 冻结回 fork 当前版再推；应用代码全量跟上游，镜像构建不受影响。
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: '37 2 * * *'   # 每天 10:37 CST；docker-build 每天 11:37 CST 兜底打新镜像
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 强制合并上游
+        id: merge
+        run: |
+          set -e
+          git remote add upstream https://github.com/fancydirty/mediary-scout.git
+          git fetch upstream main
+
+          before="$(git rev-parse HEAD)"
+          upstream_head="$(git rev-parse upstream/main)"
+
+          if ! git merge -X theirs upstream/main --no-edit \
+            -m "chore(sync): 强制合并 fancydirty/mediary-scout@${upstream_head:0:7}"; then
+            # -X theirs 处理不了删除类冲突；残留冲突一律以上游为准
+            git diff -z --name-only --diff-filter=U | while IFS= read -r -d '' f; do
+              if git cat-file -e "upstream/main:$f" 2>/dev/null; then
+                git checkout --theirs -- "$f"
+                git add "$f"
+              else
+                git rm "$f"
+              fi
+            done
+            git commit --no-edit
+          fi
+
+          # 冻结 .github/workflows 为 fork 版（GITHUB_TOKEN 推不了 workflow 变更）：
+          # 删掉上游新增的 workflow 文件，再把已跟踪的恢复成合并前的版本。
+          for f in $(git ls-tree -r --name-only HEAD -- .github/workflows); do
+            if ! git cat-file -e "$before:$f" 2>/dev/null; then
+              git rm -q "$f"
+            fi
+          done
+          git checkout "$before" -- .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m "ci(sync): 冻结 .github/workflows 为 fork 版"
+          fi
+
+          if [ "$before" = "$(git rev-parse HEAD)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游无新提交，无需同步"
+          else
+            git push origin main
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "已同步到上游 ${upstream_head:0:7}"
+          fi
+
+      - name: 同步失败时创建 Issue
+        if: failure() && steps.merge.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Upstream sync failed — manual merge needed',
+              body: '自动同步上游 `fancydirty/mediary-scout` 失败，请本地处理。\n\nRun: ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId
+            });
